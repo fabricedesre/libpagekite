@@ -1,7 +1,7 @@
 /******************************************************************************
-utils.c - Utility functions for pagekite.
+pkutils.c - Utility functions for pagekite.
 
-This file is Copyright 2011-2015, The Beanstalks Project ehf.
+This file is Copyright 2011-2017, The Beanstalks Project ehf.
 
 This program is free software: you can redistribute it and/or modify it under
 the terms  of the  Apache  License 2.0  as published by the  Apache  Software
@@ -30,6 +30,81 @@ Note: For alternate license terms, see the file COPYING.md.
 #include <poll.h>
 #define HAVE_POLL
 #endif
+
+char random_junk[32] = {
+  0x95, 0xe9, 0x2a, 0x96, 0x97, 0x73, 0x26, 0xaf,
+  0xfc, 0x53, 0xb5, 0x5f, 0x34, 0x57, 0x09, 0xa8,
+  0x7a, 0x18, 0x70, 0xe3, 0xe4, 0xe2, 0xae, 0x83,
+  0x04, 0x7d, 0xf5, 0xd5, 0xc0, 0x61, 0x0d, 0x00};
+
+
+void better_srand(int allow_updates)
+{
+  static int allow_srand = 0;
+  allow_srand = (allow_updates >= 0) ? allow_updates : allow_srand;
+
+  int fd = open("/dev/urandom", O_RDONLY);
+  if (fd >= 0) {
+    random_junk[0] = '\0';
+    while (random_junk[0] == '\0' || random_junk[1] == '\0') {
+      if (read(fd, random_junk, 31) < 4) random_junk[0] = '\0';
+      random_junk[31] = '\0';
+    }
+    close(fd);
+  }
+  else {
+    /* FIXME: Are we on Windows? */
+  }
+
+  if (allow_srand) {
+    /* We don't srand() using our random_junk directly, as that might leak
+     * our random state if values from rand() are used unmodified.
+     */
+    int rj = (random_junk[0] << 9 | random_junk[1] << 18 | random_junk[2]);
+    srand(time(0) ^ getpid() ^ rj);
+  }
+}
+
+/* Source: https://en.wikipedia.org/wiki/MurmurHash
+ * Note: Fixed seed for simplicity.
+ */
+int32_t murmur3_32(const uint8_t* key, size_t len) {
+  uint32_t h = 0xd3632a4d;
+  if (len > 3) {
+    const uint32_t* key_x4 = (const uint32_t*) key;
+    size_t i = len >> 2;
+    do {
+      uint32_t k = *key_x4++;
+      k *= 0xcc9e2d51;
+      k = (k << 15) | (k >> 17);
+      k *= 0x1b873593;
+      h ^= k;
+      h = (h << 13) | (h >> 19);
+      h += (h << 2) + 0xe6546b64;
+    } while (--i);
+    key = (const uint8_t*) key_x4;
+  }
+  if (len & 3) {
+    size_t i = len & 3;
+    uint32_t k = 0;
+    key = &key[i - 1];
+    do {
+      k <<= 8;
+      k |= *key--;
+    } while (--i);
+    k *= 0xcc9e2d51;
+    k = (k << 15) | (k >> 17);
+    k *= 0x1b873593;
+    h ^= k;
+  }
+  h ^= len;
+  h ^= h >> 16;
+  h *= 0x85ebca6b;
+  h ^= h >> 13;
+  h *= 0xc2b2ae35;
+  h ^= h >> 16;
+  return h;
+}
 
 int zero_first_crlf(int length, char* data)
 {
@@ -458,7 +533,10 @@ int printable_binary(char* dest, size_t dlen, const char* src, size_t slen)
         *dest++ = '\0';
         return copied;
       }
-      int wrote = sprintf(dest, "\\x%2.2x", *p);
+      /* The cast to unsigned char is required, otherwise 'negative' byte
+       * values will be sign-extended to int and will take more than four
+       * bytes; e.g. 255 is printed as \xffffffff */
+      int wrote = sprintf(dest, "\\x%2.2x", (unsigned char) *p);
       dest += wrote;
       dlen -= wrote;
     }

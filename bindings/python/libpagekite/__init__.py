@@ -4,7 +4,7 @@
 #       * * *   WARNING: This file is auto-generated, do not edit!  * * *
 # 
 ###############################################################################
-# This file is Copyright 2012-2016, The Beanstalks Project ehf.
+# This file is Copyright 2012-2017, The Beanstalks Project ehf.
 # 
 # This program is free software: you can redistribute it and/or modify it under
 # the terms  of the  Apache  License 2.0  as published by the  Apache  Software
@@ -39,6 +39,7 @@ PK_WITH_SERVICE_FRONTENDS = 0x0008
 PK_WITHOUT_SERVICE_FRONTENDS = 0x0010
 PK_WITH_DYNAMIC_FE_LIST = 0x0020
 PK_WITH_FRONTEND_SNI = 0x0040
+PK_WITH_SRAND_RESEED = 0x0080
 PK_AS_FRONTEND_RELAY = 0x0100
 PK_WITH_SYSLOG = 0x0200
 PK_LOG_TUNNEL_DATA = 0x000100

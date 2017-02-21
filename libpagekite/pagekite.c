@@ -3,7 +3,7 @@ pagekite.c - High level library interface
 
 *******************************************************************************
 
-This file is Copyright 2012-2015, The Beanstalks Project ehf.
+This file is Copyright 2012-2017, The Beanstalks Project ehf.
 
 This program is free software: you can redistribute it and/or modify it under
 the terms  of the  Apache  License 2.0  as published by the  Apache  Software
@@ -37,7 +37,7 @@ Note: For alternate license terms, see the file COPYING.md.
 #endif
 
 #define PK_DEFAULT_FLAGS (PK_WITH_SSL | PK_WITH_IPV4 | PK_WITH_IPV6 | \
-                          PK_WITH_DYNAMIC_FE_LIST)
+                          PK_WITH_DYNAMIC_FE_LIST | PK_WITH_SRAND_RESEED)
 
 
 static struct pk_manager* PK_MANAGER(pagekite_mgr pkm) {
@@ -58,6 +58,8 @@ pagekite_mgr pagekite_init(
   struct pk_manager *pkm_;
 
   if (flags & PK_WITH_DEFAULTS || !flags) flags |= PK_DEFAULT_FLAGS;
+
+  if (flags & PK_WITH_SRAND_RESEED) better_srand(PK_RANDOM_RESEED_SRAND);
 
 #ifdef _MSC_VER
   WSADATA wsa_data;

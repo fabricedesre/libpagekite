@@ -1,7 +1,7 @@
 /******************************************************************************
-utils.h - Utility functions for pagekite.
+pkutils.h - Utility functions for pagekite.
 
-This file is Copyright 2011-2015, The Beanstalks Project ehf.
+This file is Copyright 2011-2017, The Beanstalks Project ehf.
 
 This program is free software: you can redistribute it and/or modify it under
 the terms  of the  Apache  License 2.0  as published by the  Apache  Software
@@ -21,6 +21,14 @@ Note: For alternate license terms, see the file COPYING.md.
 #define strncpyz(dest, src, len) { strncpy(dest, src, len); dest[len] = '\0'; }
 #define free_outside(ptr, buf, len) { if ((ptr != NULL) && ((ptr < buf) || (ptr >= buf+len))) free(ptr); }
 
+#define PK_RANDOM_DEFAULT      -1
+#define PK_RANDOM_FIXED_SRAND   0
+#define PK_RANDOM_RESEED_SRAND  1
+
+extern char random_junk[];
+
+void better_srand(int);
+int32_t murmur3_32(const uint8_t* key, size_t len);
 int zero_first_crlf(int, char*);
 int zero_first_whitespace(int, char*);
 int zero_nth_char(int, char, int, char*);

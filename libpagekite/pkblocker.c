@@ -1,7 +1,7 @@
 /******************************************************************************
 pkblocker.c - Blocking tasks handled outside the main event loop.
 
-This file is Copyright 2011-2015, The Beanstalks Project ehf.
+This file is Copyright 2011-2017, The Beanstalks Project ehf.
 
 This program is free software: you can redistribute it and/or modify it under
 the terms  of the  Apache  License 2.0  as published by the  Apache  Software
@@ -405,6 +405,8 @@ void* pkb_tunnel_ping(void* void_fe) {
     bytes = timed_read(sockfd, buffer, 116, 1000);
     buffer[116] = '\0';
 
+    PKS_close(sockfd);
+
     want = strlen(PK_FRONTEND_PONG);
     if ((bytes < want) ||
         (0 != strncmp(buffer, PK_FRONTEND_PONG, want))) {
@@ -414,7 +416,6 @@ void* pkb_tunnel_ping(void* void_fe) {
       sleep(2); /* We don't want to return first! */
       return NULL;
     }
-    PKS_close(sockfd);
     gettimeofday(&tv2, NULL);
 
     fe->priority = (tv2.tv_sec - tv1.tv_sec) * 1000
@@ -612,6 +613,7 @@ void pkb_check_world(struct pk_manager* pkm)
   }
   pk_log(PK_LOG_MANAGER_DEBUG,
          "Checking state of world... (v%s)", PK_VERSION);
+  better_srand(PK_RANDOM_DEFAULT);
   pkb_clear_transient_flags(pkm);
   pkb_check_tunnel_pingtimes(pkm);
   pkb_check_kites_dns(pkm);

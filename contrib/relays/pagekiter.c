@@ -5,7 +5,7 @@ Usage: pagekiter [options] PROTO NAME.foo.com SECRET ...
 
 *******************************************************************************
 
-This file is Copyright 2015, The Beanstalks Project ehf.
+This file is Copyright 2015-2017, The Beanstalks Project ehf.
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published
@@ -97,13 +97,13 @@ int main(int argc, char **argv) {
   int init_kites = 0;
   int init_conns = 0;
   int ac;
-  int flags = (PK_WITH_SSL | PK_WITH_IPV4 | PK_AS_FRONTEND_RELAY);
+  int flags = (PK_WITH_SSL
+              |PK_WITH_IPV4
+              |PK_WITH_SRAND_RESEED
+              |PK_AS_FRONTEND_RELAY);
 #ifdef HAVE_IPV6
   flags |= PK_WITH_IPV6;
 #endif
-
-  /* FIXME: Is this too lame? */
-  srand(time(0) ^ getpid());
 
   while (-1 != (ac = getopt(argc, argv, "46Ic:k:Lo:p:qvW"))) {
     switch (ac) {

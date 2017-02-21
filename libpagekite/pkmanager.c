@@ -1,7 +1,7 @@
 /******************************************************************************
 pkmanager.c - A manager for multiple pagekite connections.
 
-This file is Copyright 2011-2016, The Beanstalks Project ehf.
+This file is Copyright 2011-2017, The Beanstalks Project ehf.
 
 This program is free software: you can redistribute it and/or modify it under
 the terms  of the  Apache  License 2.0  as published by the  Apache  Software
@@ -68,7 +68,7 @@ static void pkm_reset_timer(struct pk_manager*);
 static void pkm_reset_manager(struct pk_manager*);
 static struct pk_pagekite* pkm_find_kite(struct pk_manager*,
                                          const char*, const char*, int);
-static unsigned char pkm_sid_shift(char *);
+static unsigned int pkm_sid_shift(char *);
 
 #ifndef HAVE_PTHREAD_YIELD
 #  ifdef HAVE_PTHREAD_YIELD_NP
@@ -310,7 +310,8 @@ struct pk_backend_conn* pkm_connect_be(struct pk_tunnel* fe,
   struct timeval to;
   to.tv_sec = pk_state.socket_timeout_s;
   to.tv_usec = 0;
-  errno = sockfd = 0;
+  errno = 0;
+  sockfd = -1;
   if ((NULL == addr) ||
       (0 > (sockfd = PKS_socket(AF_INET, SOCK_STREAM, 0))) ||
       PKS_fail(PKS_connect(sockfd, (struct sockaddr*) addr, sizeof(*addr))) ||
@@ -322,7 +323,9 @@ struct pk_backend_conn* pkm_connect_be(struct pk_tunnel* fe,
       /* FIXME:
          EINPROGRESS never happens until we swap connect/set_non_blocking
          above.  Do that later once we've figured out error handling. */
-      PKS_close(sockfd);
+      if (sockfd > -1)
+        PKS_close(sockfd);
+
       pkm_yield_stop(fe->manager);
       pkm_free_be_conn(pkb);
       pk_log(PK_LOG_TUNNEL_CONNS, "pkm_connect_be: Failed to connect %s:%d",
@@ -1305,16 +1308,9 @@ struct pk_tunnel* pkm_add_frontend_ai(struct pk_manager* pkm,
   return adding;
 }
 
-static unsigned char pkm_sid_shift(char *sid)
+static unsigned int pkm_sid_shift(char *sid)
 {
-  unsigned char shift;
-  char *c;
-
-  for (c = sid, shift = 0; *c != '\0'; c++) {
-    shift = (shift << 3) | (shift >> 5);
-    shift ^= *c;
-  }
-  return shift;
+  return murmur3_32(sid, strlen(sid));
 }
 
 struct pk_backend_conn* pkm_alloc_be_conn(struct pk_manager* pkm,
@@ -1322,7 +1318,7 @@ struct pk_backend_conn* pkm_alloc_be_conn(struct pk_manager* pkm,
 {
   int i, evicting;
   time_t max_age;
-  unsigned char shift;
+  unsigned int shift;
   struct pk_backend_conn* pkb;
   struct pk_backend_conn* pkb_oldest;
 
@@ -1389,12 +1385,12 @@ struct pk_backend_conn* pkm_find_be_conn(struct pk_manager* pkm,
                                          struct pk_tunnel* fe, char* sid)
 {
   int i;
-  unsigned char shift;
+  unsigned int shift;
   struct pk_backend_conn* pkb;
 
   PK_TRACE_FUNCTION;
 
-  shift = pkm_sid_shift(sid);
+  shift = pkm_sid_shift(sid) % pkm->be_conn_max;
   for (i = 0; i < pkm->be_conn_max; i++) {
     pkb = (pkm->be_conns + ((i + shift) % pkm->be_conn_max));
     if ((pkb->conn.status & CONN_STATUS_ALLOCATED) &&
@@ -1420,6 +1416,10 @@ struct pk_manager* pkm_manager_init(struct ev_loop* loop,
 
   PK_TRACE_FUNCTION;
   PK_INIT_MEMORY_CANARIES;
+
+  /* Make sure we have some good random junk to work with, and re-seed
+   * rand() if allowed. */
+  better_srand(PK_RANDOM_DEFAULT);
 
 #ifdef HAVE_OPENSSL
   pk_log(PK_LOG_TUNNEL_DATA, "SSL_ERROR_ZERO_RETURN = %d", SSL_ERROR_ZERO_RETURN);
