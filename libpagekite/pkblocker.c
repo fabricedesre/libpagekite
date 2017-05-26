@@ -128,6 +128,10 @@ void pkb_choose_tunnels(struct pk_manager* pkm)
       /* Is tunnel really a front-end? */
       if ((fe->fe_hostname == NULL) || (fe->ai.ai_addr == NULL)) continue;
 
+      /* Is tunnel in the middle of connecting still? That's a bad sign,
+       * don't consider it a candidate for "fastest" in this round. */
+      if (fe->conn.status & CONN_STATUS_CHANGING) continue;
+
       prio = fe->priority + (25 * fe->error_count);
       if ((fe->ai.ai_addr) &&
           (fe->fe_hostname) &&
@@ -376,7 +380,7 @@ void* pkb_tunnel_ping(void* void_fe) {
   in_addr_to_str(fe->ai.ai_addr, printip, 1024);
 
   if (pk_state.fake_ping) {
-    fe->priority = rand() % 500;
+    fe->priority = 1 + (rand() % 500);
   }
   else {
     gettimeofday(&tv1, NULL);
@@ -418,11 +422,12 @@ void* pkb_tunnel_ping(void* void_fe) {
     }
     gettimeofday(&tv2, NULL);
 
-    fe->priority = (tv2.tv_sec - tv1.tv_sec) * 1000
-                 + (tv2.tv_usec - tv1.tv_usec) / 1000;
+    fe->priority = ((tv2.tv_sec - tv1.tv_sec) * 1000)
+                 + ((tv2.tv_usec - tv1.tv_usec) / 1000)
+                 + 1;
 
     if (strcasestr(buffer, PK_FRONTEND_OVERLOADED) != NULL) {
-      fe->priority += 1;
+      fe->priority += 1000;
       sleep(2); /* We don't want to return first! */
     }
   }
@@ -434,6 +439,7 @@ void* pkb_tunnel_ping(void* void_fe) {
      * make sure new tunnels don't stay ignored forever. */
     fe->priority /= 10;
     fe->priority *= 9;
+    if (fe->priority < 1) fe->priority = 1;
     pk_log(PK_LOG_MANAGER_DEBUG,
            "Ping %s: %dms (biased)", printip, fe->priority);
   }
@@ -441,6 +447,7 @@ void* pkb_tunnel_ping(void* void_fe) {
     /* Add artificial +/-5% jitter to ping results */
     fe->priority *= ((rand() % 11) + 95);
     fe->priority /= 100;
+    if (fe->priority < 1) fe->priority = 1;
     pk_log(PK_LOG_MANAGER_DEBUG, "Ping %s: %dms", printip, fe->priority);
   }
 
@@ -587,10 +594,11 @@ void pkb_log_fe_status(struct pk_manager* pkm)
           sprintf(ddnsinfo, " (in DNS %us ago)", ddnsup_ago);
         }
         pk_log(PK_LOG_MANAGER_DEBUG,
-               "Relay; status=0x%8.8x; errors=%d; info=%s%s%s%s%s%s%s%s",
+               "Relay; status=0x%8.8x; errors=%d; info=%s%s%s%s%s%s%s%s%s",
                fe->conn.status,
                fe->error_count,
                printip,
+               (fe->conn.status & CONN_STATUS_CHANGING) ? " changing": "",
                (fe->conn.status & FE_STATUS_REJECTED) ? " rejected": "",
                (fe->conn.status & FE_STATUS_WANTED) ? " wanted": "",
                (fe->conn.status & FE_STATUS_LAME) ? " lame": "",
@@ -668,8 +676,8 @@ void pkb_check_tunnels(struct pk_manager* pkm)
 
 void* pkb_run_blocker(void *void_pkblocker)
 {
-  time_t last_check_world = 0;
-  time_t last_check_tunnels = 0;
+  static time_t last_check_world = 0;
+  static time_t last_check_tunnels = 0;
   struct pk_job job;
   struct pk_blocker* this = (struct pk_blocker*) void_pkblocker;
   struct pk_manager* pkm = this->manager;
@@ -686,13 +694,17 @@ void* pkb_run_blocker(void *void_pkblocker)
 
   while (1) {
     pkb_get_job(&(pkm->blocking_jobs), &job);
+
+    time_t now = time(0);
     switch (job.job) {
       case PK_NO_JOB:
         break;
       case PK_CHECK_WORLD:
-        if (time(0) >= last_check_world + pkm->housekeeping_interval_min) {
-          pkm_reconfig_start((struct pk_manager*) job.ptr_data);
+        if ((now >= last_check_world + pkm->housekeeping_interval_min) &&
+            (0 == pkm_reconfig_start((struct pk_manager*) job.ptr_data)))
+        {
           if (PK_HOOK(PK_HOOK_CHECK_WORLD, 0, this, pkm)) {
+            last_check_tunnels = now;
             pkb_check_world((struct pk_manager*) job.ptr_data);
             pkb_check_tunnels((struct pk_manager*) job.ptr_data);
             last_check_world = last_check_tunnels = time(0);
@@ -702,9 +714,11 @@ void* pkb_run_blocker(void *void_pkblocker)
         }
         break;
       case PK_CHECK_FRONTENDS:
-        if (time(0) >= last_check_tunnels + pkm->housekeeping_interval_min) {
-          pkm_reconfig_start((struct pk_manager*) job.ptr_data);
+        if ((now >= last_check_tunnels + pkm->housekeeping_interval_min) &&
+            (0 == pkm_reconfig_start((struct pk_manager*) job.ptr_data)))
+        {
           if (PK_HOOK(PK_HOOK_CHECK_TUNNELS, 0, this, pkm)) {
+            last_check_tunnels = now;
             pkb_check_tunnels((struct pk_manager*) job.ptr_data);
             last_check_tunnels = time(0);
             PK_HOOK(PK_HOOK_CHECK_TUNNELS, 1, this, pkm);
@@ -738,14 +752,17 @@ int pkb_start_blockers(struct pk_manager *pkm, int n)
     if (pkm->blocking_threads[i] == NULL) {
       pkm->blocking_threads[i] = malloc(sizeof(struct pk_blocker));
       pkm->blocking_threads[i]->manager = pkm;
+#if HAVE_LUA
+      pkm->blocking_threads[i]->lua = NULL;
+#endif
       if (0 > pthread_create(&(pkm->blocking_threads[i]->thread), NULL,
                              pkb_run_blocker,
                              (void *) pkm->blocking_threads[i])) {
         pk_log(PK_LOG_MANAGER_ERROR, "Failed to start blocking thread.");
-        free(pkm->blocking_threads[i]);
 #if HAVE_LUA
         pklua_close_lua(pkm->blocking_threads[i]->lua);
 #endif
+        free(pkm->blocking_threads[i]);
         pkm->blocking_threads[i] = NULL;
         return (pk_error = ERR_NO_THREAD);
       }
@@ -761,7 +778,9 @@ int pkb_start_blockers(struct pk_manager *pkm, int n)
 void pkb_stop_blockers(struct pk_manager *pkm)
 {
   int i;
-  pkb_add_job(&(pkm->blocking_jobs), PK_QUIT, 0, NULL);
+  for (i = 0; i < pkm->blocking_jobs.max; i++) {
+    pkb_add_job(&(pkm->blocking_jobs), PK_QUIT, 0, NULL);
+  }
   for (i = 0; i < MAX_BLOCKING_THREADS; i++) {
     if (pkm->blocking_threads[i] != NULL) {
       pthread_join(pkm->blocking_threads[i]->thread, NULL);

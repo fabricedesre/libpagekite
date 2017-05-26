@@ -37,6 +37,12 @@ Note: For alternate license terms, see the file COPYING.md.
 void pkc_reset_conn(struct pk_conn* pkc, unsigned int status)
 {
   PK_ADD_MEMORY_CANARY(pkc);
+  if ((pkc->status & CONN_STATUS_CHANGING) && !(status & CONN_STATUS_CHANGING)) {
+    /* This will warn about the reset unless the status argument
+     * explicitly says this is part of an ongoing change. */
+    pk_log(PK_LOG_ERROR,
+           "%d: BUG! Attempt to reset conn mid-change!", pkc->sockfd);
+  }
   pkc->status &= ~CONN_STATUS_BITS;
   pkc->status |= status;
   pkc->activity = time(0);
@@ -65,7 +71,7 @@ int pkc_connect(struct pk_conn* pkc, struct addrinfo* ai)
   int fd;
   to.tv_sec = pk_state.socket_timeout_s;
   to.tv_usec = 0;
-  pkc_reset_conn(pkc, CONN_STATUS_ALLOCATED);
+  pkc_reset_conn(pkc, CONN_STATUS_CHANGING|CONN_STATUS_ALLOCATED);
   if ((0 > (fd = PKS_socket(ai->ai_family, ai->ai_socktype,
                             ai->ai_protocol))) ||
       PKS_fail(PKS_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (char *) &to, sizeof(to))) ||
@@ -75,6 +81,12 @@ int pkc_connect(struct pk_conn* pkc, struct addrinfo* ai)
     if (fd >= 0) PKS_close(fd);
     return (pk_error = ERR_CONNECT_CONNECT);
   }
+
+/* Uncomment to poorly simulate a bad network
+  int s = rand() % 15;
+  fprintf(stderr, "TESTING SLEEP %d\n", s);
+  sleep(s);
+ */
 
   /* FIXME: Add support for chaining through socks or HTTP proxies */
   return (pkc->sockfd = fd);
@@ -86,7 +98,9 @@ int pkc_listen(struct pk_conn* pkc, struct addrinfo* ai, int backlog)
   struct sockaddr_in sin;
   socklen_t len = sizeof(sin);
 
-  pkc_reset_conn(pkc, CONN_STATUS_ALLOCATED|CONN_STATUS_LISTENING);
+  pkc_reset_conn(pkc, CONN_STATUS_CHANGING |
+                      CONN_STATUS_ALLOCATED |
+                      CONN_STATUS_LISTENING);
   if ((0 > (fd = PKS_socket(ai->ai_family, ai->ai_socktype,
                             ai->ai_protocol))) ||
       PKS_fail(PKS_bind(fd, ai->ai_addr, ai->ai_addrlen)) ||
@@ -153,6 +167,7 @@ static void pkc_do_handshake(struct pk_conn *pkc)
         pk_log(PK_LOG_BE_CONNS|PK_LOG_TUNNEL_CONNS,
                "%d: TLS handshake failed!", pkc->sockfd);
         pkc->status |= CONN_STATUS_BROKEN;
+        errno = ECONNRESET;
         break;
     }
   }
@@ -248,8 +263,7 @@ ssize_t pkc_read(struct pk_conn* pkc)
 
   if (bytes > 0) {
     if (pk_state.log_mask & PK_LOG_TRACE) {
-      pk_log_raw_data(PK_LOG_TRACE,
-                      "R", PKC_IN(*pkc), (bytes > 64) ? 64 : bytes);
+      pk_log_raw_data(PK_LOG_TRACE, "R", pkc->sockfd, PKC_IN(*pkc), bytes);
     }
 
     pkc->in_buffer_pos += bytes;
@@ -308,6 +322,18 @@ ssize_t pkc_read(struct pk_conn* pkc)
   return bytes;
 }
 
+int pkc_pending(struct pk_conn* pkc)
+{
+#ifdef HAVE_OPENSSL
+  switch (pkc->state) {
+    case CONN_SSL_DATA:
+    case CONN_SSL_HANDSHAKE:
+      return SSL_pending(pkc->ssl);
+  }
+#endif
+  return 0;
+}
+
 ssize_t pkc_raw_write(struct pk_conn* pkc, char* data, ssize_t length) {
   ssize_t wrote = 0;
   errno = 0;
@@ -330,6 +356,7 @@ ssize_t pkc_raw_write(struct pk_conn* pkc, char* data, ssize_t length) {
               pkc->want_write = length;
               break;
             default:
+              if (0 == errno) errno = EIO;
               pk_log(PK_LOG_BE_DATA|PK_LOG_TUNNEL_DATA,
                      "%d: SSL_ERROR=%d: %p/%d/%d",
                      pkc->sockfd, err, data, wrote, length);
@@ -349,8 +376,7 @@ ssize_t pkc_raw_write(struct pk_conn* pkc, char* data, ssize_t length) {
   }
   if (wrote > 0) {
     if (pk_state.log_mask & PK_LOG_TRACE) {
-      pk_log_raw_data(PK_LOG_TRACE,
-                      "W", data, (wrote > 64) ? 64 : wrote);
+      pk_log_raw_data(PK_LOG_TRACE, "W", pkc->sockfd, data, wrote);
     }
     pkc->wrote_bytes += wrote;
   }
@@ -377,6 +403,7 @@ ssize_t pkc_flush(struct pk_conn* pkc, char *data, ssize_t length, int mode,
 {
   ssize_t flushed, wrote, bytes;
   flushed = wrote = errno = bytes = 0;
+  int loops_left = 1000;
 
   if (pkc->sockfd < 0) {
     pk_log(PK_LOG_BE_DATA|PK_LOG_TUNNEL_DATA|PK_LOG_ERROR,
@@ -408,7 +435,16 @@ ssize_t pkc_flush(struct pk_conn* pkc, char *data, ssize_t length, int mode,
     else if ((errno != EINTR) && (errno != 0))
       break;
   } while ((mode == BLOCKING_FLUSH) &&
-           (pkc->out_buffer_pos > 0));
+           (pkc->out_buffer_pos > 0) &&
+           (loops_left-- > 0));
+
+  if (loops_left <= 0) {
+    pk_log(PK_LOG_BE_DATA|PK_LOG_TUNNEL_DATA|PK_LOG_ERROR,
+           "%d[%s]: BUG! Flush failed after 1000 iterations",
+           pkc->sockfd, where);
+    errno = EIO;
+    return -1;
+  }
 
   /* At this point we either have a non-EINTR error, or we've flushed
    * everything.  Return errors, else continue. */
@@ -432,8 +468,16 @@ ssize_t pkc_flush(struct pk_conn* pkc, char *data, ssize_t length, int mode,
         wrote += bytes;
         flushed += bytes;
       }
-      else if ((errno != EINTR) && (errno != 0))
+      else if ((errno != EINTR) && (errno != 0)) {
         break;
+      }
+      else if (loops_left-- <= 0) {
+        pk_log(PK_LOG_BE_DATA|PK_LOG_TUNNEL_DATA|PK_LOG_ERROR,
+               "%d[%s]: BUG! Flush failed after 1000 iterations",
+               pkc->sockfd, where);
+        errno = EIO;
+        break;
+      }
     }
     /* At this point, if we have a non-EINTR error, bytes is < 0 and we
      * want to return that.  Otherwise, return how much got written. */
@@ -482,7 +526,11 @@ ssize_t pkc_write(struct pk_conn* pkc, char* data, ssize_t length)
     }
     else {
       /* 2b. If new+old data > buffer size, do a blocking write. */
-      pkc_flush(pkc, data+wrote, length-wrote, BLOCKING_FLUSH, "pkc_write/2");
+      if (0 > pkc_flush(pkc, data+wrote, length-wrote, BLOCKING_FLUSH,
+                        "pkc_write/2")) {
+        /* Give up and return an error. We are broken. */
+        return -1;
+      }
     }
   }
 

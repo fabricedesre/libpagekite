@@ -161,7 +161,7 @@ int parse_chunk_header(struct pk_frame* frame, struct pk_chunk* chunk,
   chunk->header_count = 0;
   while (2 < (len = zero_first_crlf(bytes - pos, frame->data + pos)))
   {
-    PK_TRACE_LOOP("lines");
+    PK_TRACE_LOOP("chunk-header-lines");
 
     /* This gives us an upper-case (US-ASCII) of the first character. */
     first = *(frame->data + pos) & (0xff - 32);
@@ -274,6 +274,7 @@ int pk_parser_parse_new_data(struct pk_parser *parser, int length)
        (wanted_length > frame->raw_length)) {
     fragmenting = 1;
     parse_length = frame->raw_length - frame->hdr_length;
+    PK_TRACE_LOOP("fragmenting");
   }
 
   /* Do we have enough data? */
@@ -287,19 +288,34 @@ int pk_parser_parse_new_data(struct pk_parser *parser, int length)
         return (pk_error = ERR_PARSE_BAD_CHUNK);
     }
     else {
-      if (chunk->offset + length > chunk->total)
+      if (chunk->offset + length > chunk->total) {
         chunk->length = chunk->total - chunk->offset;
-      else
+      }
+      else {
         chunk->length = length;
+      }
     }
     chunk->offset += chunk->length;
 
     if (parser->chunk_callback != (pkChunkCallback *) NULL) {
-      /* FIXME: if fragmenting, we should suppress EOFs */
+      char *eof = chunk->eof;
+      char *data = chunk->data;
+      size_t length = chunk->length;
+
+      PK_TRACE_LOOP("callback");
+      if (fragmenting) chunk->eof = NULL;  /* Suppress EOFs */
       parser->chunk_callback(parser->chunk_callback_data, chunk);
+
+      /* Restore these, as they may have been modified in the callback and
+       * thus broken our accounting. */
+      chunk->eof = eof;
+      chunk->data = data;
+      chunk->length = length;
+      chunk->first_chunk = 0;
     }
 
     if (fragmenting || (chunk->offset < chunk->total)) {
+      PK_TRACE_LOOP("adjusting");
       frame->length -= chunk->length;
       frame->raw_length -= chunk->length;
       parser->buffer_bytes_left += chunk->length;
@@ -307,6 +323,7 @@ int pk_parser_parse_new_data(struct pk_parser *parser, int length)
     else {
       leftovers = frame->raw_length - wanted_length;
       if (leftovers > 0) {
+        PK_TRACE_LOOP("memmove");
         memmove(frame->raw_frame,
                 frame->raw_frame + wanted_length,
                 leftovers);
@@ -314,6 +331,7 @@ int pk_parser_parse_new_data(struct pk_parser *parser, int length)
         pk_parser_parse_new_data(parser, leftovers);
       }
       else {
+        PK_TRACE_LOOP("reset");
         pk_parser_reset(parser);
       }
     }
@@ -337,10 +355,12 @@ int pk_parser_parse(struct pk_parser *parser, int length, char *data)
       return (pk_error = ERR_PARSE_NO_MEMORY);
     }
 
-    if (length > parser->buffer_bytes_left)
+    if (length > parser->buffer_bytes_left) {
       copy = parser->buffer_bytes_left;
-    else
+    }
+    else {
       copy = length;
+    }
 
     memcpy(frame->raw_frame + frame->raw_length, data, copy);
     status = pk_parser_parse_new_data(parser, copy);
@@ -563,6 +583,16 @@ char *pk_parse_kite_request(struct pk_kite_request* kite_r, const char *line)
   }
   *(fsalt++) = '\0';
 
+  /* Error out if things are too large. */
+  if ((strlen(protocol) > PK_PROTOCOL_LENGTH) ||
+      (strlen(public_domain) > PK_DOMAIN_LENGTH) ||
+      (strlen(bsalt) > PK_SALT_LENGTH) ||
+      (strlen(fsalt) > PK_SALT_LENGTH)) {
+    free(copy);
+    return pk_err_null(ERR_PARSE_NO_KITENAME);
+  }
+
+  /* Copy the values */
   strncpyz(kite->protocol, protocol, PK_PROTOCOL_LENGTH);
   strncpyz(kite->public_domain, public_domain, PK_DOMAIN_LENGTH);
   strncpyz(kite_r->bsalt, bsalt, PK_SALT_LENGTH);
@@ -588,22 +618,26 @@ int pk_connect_ai(struct pk_conn* pkc, struct addrinfo* ai, int reconnecting,
   struct pk_pagekite tkite;
   struct pk_kite_request tkite_r;
 
-  pk_log(PK_LOG_TUNNEL_CONNS, "Connecting to %s (session=%s)",
-                              in_addr_to_str(ai->ai_addr, buffer, 1024),
-                              (session_id && session_id[0] != '\0')
-                               ? session_id : "new");
-
+  pkc->status |= CONN_STATUS_CHANGING;
+  pk_log(PK_LOG_TUNNEL_CONNS,
+         "Connecting to %s (session=%s%s%s)",
+         in_addr_to_str(ai->ai_addr, buffer, 1024),
+         (session_id && session_id[0] != '\0') ? session_id : "new",
+         (pkc->status & FE_STATUS_IS_FAST) ? ", is fast" : "",
+         (pkc->status & FE_STATUS_IN_DNS) ? ", in DNS" : "",
+         (pkc->status & FE_STATUS_NAILED_UP) ? ", nailed up" : "");
   if (0 > pkc_connect(pkc, ai))
     return (pk_error = ERR_CONNECT_CONNECT);
 
-  memset(&buffer, 0, 16*1024);
   set_blocking(pkc->sockfd);
+
 #ifdef HAVE_OPENSSL
   if ((ctx != NULL) &&
       (0 != pkc_start_ssl(pkc, ctx, hostname)))
     return (pk_error = ERR_CONNECT_TLS);
 #endif
 
+  memset(&buffer, 0, 16*1024);
   pkc_write(pkc, PK_HANDSHAKE_CONNECT, strlen(PK_HANDSHAKE_CONNECT));
   pkc_write(pkc, PK_HANDSHAKE_FEATURES, strlen(PK_HANDSHAKE_FEATURES));
   if (session_id && *session_id) {
@@ -624,7 +658,7 @@ int pk_connect_ai(struct pk_conn* pkc, struct addrinfo* ai, int reconnecting,
   pk_log(PK_LOG_TUNNEL_DATA, " - End handshake, flushing.");
   pkc_write(pkc, PK_HANDSHAKE_END, strlen(PK_HANDSHAKE_END));
   if (0 > pkc_flush(pkc, NULL, 0, BLOCKING_FLUSH, "pk_connect_ai")) {
-    pkc_reset_conn(pkc, CONN_STATUS_ALLOCATED);
+    pkc_reset_conn(pkc, CONN_STATUS_CHANGING|CONN_STATUS_ALLOCATED);
     return (pk_error = ERR_CONNECT_REQUEST);
   }
 
@@ -668,7 +702,7 @@ int pk_connect_ai(struct pk_conn* pkc, struct addrinfo* ai, int reconnecting,
     if ((strncasecmp(p, "X-PageKite-Duplicate:", 21) == 0) ||
         (strncasecmp(p, "X-PageKite-Invalid:", 19) == 0)) {
       pk_log(PK_LOG_TUNNEL_CONNS, "%s", p);
-      pkc_reset_conn(pkc, CONN_STATUS_ALLOCATED);
+      pkc_reset_conn(pkc, CONN_STATUS_CHANGING|CONN_STATUS_ALLOCATED);
       /* FIXME: Should update the status of each individual request. */
       return (pk_error = (p[12] == 'u') ? ERR_CONNECT_DUPLICATE
                                         : ERR_CONNECT_REJECTED);
@@ -706,11 +740,11 @@ int pk_connect_ai(struct pk_conn* pkc, struct addrinfo* ai, int reconnecting,
 
   if (i) {
     if (reconnecting) {
-      pkc_reset_conn(pkc, CONN_STATUS_ALLOCATED);
+      pkc_reset_conn(pkc, CONN_STATUS_CHANGING|CONN_STATUS_ALLOCATED);
       return (pk_error = ERR_CONNECT_REJECTED);
     }
     else {
-      pkc_reset_conn(pkc, CONN_STATUS_ALLOCATED);
+      pkc_reset_conn(pkc, CONN_STATUS_CHANGING|CONN_STATUS_ALLOCATED);
       return pk_connect_ai(pkc, ai, 1, n, requests, session_id, ctx, hostname);
     }
   }
@@ -732,6 +766,7 @@ int pk_connect(struct pk_conn* pkc, char *frontend, int port,
   char ports[16];
   struct addrinfo hints, *result, *rp;
 
+  pkc->status |= CONN_STATUS_CHANGING;
   pk_log(PK_LOG_TUNNEL_CONNS, "pk_connect(%s:%d, %d, %p)",
                               frontend, port, n, requests);
 
@@ -847,18 +882,30 @@ static int pkproto_test_format_pong(void)
 
 static void pkproto_test_callback(int *data, struct pk_chunk *chunk) {
   assert(chunk->sid != NULL);
-  assert(chunk->eof != NULL);
   assert(chunk->noop != NULL);
   assert(chunk->data != NULL);
-  assert(chunk->length == 5);
   assert(chunk->frame.data != NULL);
+  assert(chunk->remote_ip != NULL);
+  assert(chunk->request_proto != NULL);
   assert(0 == strcmp(chunk->sid, "1"));
-  assert(0 == strcmp(chunk->eof, "r"));
   assert(0 == strcmp(chunk->noop, "!"));
-  assert(0 == strncmp(chunk->data, "54321", chunk->length));
   assert(-1 == chunk->quota_conns);
   assert(55 == chunk->quota_days);
   assert(1234 == chunk->quota_mb);
+  if (*data < 2) {
+    assert(chunk->eof != NULL);
+    assert(0 == strcmp(chunk->eof, "r"));
+    assert(chunk->length == 5);
+    assert(0 == strncmp(chunk->data, "54321", chunk->length));
+  }
+  else if (*data == 2) {
+    chunk->first_chunk = 1;
+    pk_http_forwarding_headers_hook(0, 0, (void*) chunk, NULL);
+    assert(NULL != memmem(chunk->data, chunk->length, "X-Forward", 9));
+  }
+  else {
+    assert(NULL == memmem(chunk->data, chunk->length, "X-Forward", 9));
+  }
   *data += 1;
 }
 
@@ -867,6 +914,8 @@ static int pkproto_test_parser(struct pk_parser* p, int *callback_called)
   char* testchunk = ("SID: 1\r\n"
                      "eOf: r\r\n"
                      "NOOP: !\r\n"
+                     "Proto: http\r\n"
+                     "RIP: 127.0.0.1\r\n"
                      "Quota: 1234\r\n"
                      "QDays: 55\r\n"
                      "\r\n"
@@ -898,9 +947,25 @@ static int pkproto_test_parser(struct pk_parser* p, int *callback_called)
   assert(p->buffer_bytes_left == bytes_left);
   assert(p->chunk->data == NULL);
   assert(p->chunk->quota_days == -1);
+  assert(p->chunk->remote_ip == NULL);
 
   assert(55 == pk_state.quota_days);
   assert(1234 == pk_state.quota_mb);
+
+  /* Construct an over-large frame chunk that
+   * will require fragmented processing. */
+  char *frame = malloc(2 * PARSER_BYTES_MAX);
+  int cl = 2 * PARSER_BYTES_MAX - 10;
+  int ch = sprintf(frame, "%x\r\n", cl);
+  int cs = ch + cl;
+  strcat(frame, testchunk);
+  int hl = strlen(frame) - 5;
+  for (int i = hl; i < ch + cl; i++) frame[i] = 'A' + ((i-hl) % 26);
+  memcpy(frame+hl, "GET / HTTP/1.1\r\nHost: foo.bar.baz\r\n\r\n", 38);
+
+  pk_parser_reset(p);
+  pk_parser_parse(p, cs, frame);
+  free(frame);
 
   return 1;
 }
@@ -982,14 +1047,14 @@ int pkproto_test(void)
 
   PK_INIT_MEMORY_CANARIES;
 
-  struct pk_parser* p = pk_parser_init(64000, buffer,
+  struct pk_parser* p = pk_parser_init(PARSER_BYTES_MIN, buffer,
                                        (pkChunkCallback*) &pkproto_test_callback,
                                        &callback_called);
   return (pkproto_test_format_frame() &&
           pkproto_test_format_reply() &&
           pkproto_test_format_eof() &&
           pkproto_test_format_pong() &&
-          pkproto_test_alloc(64000, buffer, p) &&
+          pkproto_test_alloc(PARSER_BYTES_MIN, buffer, p) &&
           pkproto_test_parser(p, &callback_called) &&
           pkproto_test_make_bsalt() &&
           pkproto_test_sign_kite_request() &&
